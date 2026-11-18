@@ -7,8 +7,14 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
-import onnxruntime as ort
 import pytest
+
+try:
+    # onnxruntime is a darwin-only dependency (see pyproject); the tests that
+    # exercise the ORT session bounds are skipped where it is not installed.
+    import onnxruntime as ort
+except ModuleNotFoundError:  # pragma: no cover - Linux CI
+    ort = None
 
 from services.ssml_processor import SsmlSegment
 from services.tts_service import (
@@ -66,6 +72,7 @@ class TestSilencePhonemizerWordsMismatch:
             words_mismatch.BaseWordsMismatch._mismatched_lines = original
 
 
+@pytest.mark.skipif(ort is None, reason="onnxruntime is a darwin-only dependency")
 class TestBoundedOrtSession:
     def test_injects_arena_disabled_session_options(self, monkeypatch):
         """Regression: kokoro-onnx builds InferenceSession with no sess_options,
