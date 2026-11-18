@@ -48,6 +48,10 @@ class TestSilencePhonemizerWordsMismatch:
     def test_neutralizes_the_fatal_line_count_raise(self):
         import logging
 
+        # phonemizer-fork is a darwin-only dependency (see pyproject): there is no
+        # Linux code path to reproduce, so skip rather than fail collection here.
+        pytest.importorskip("phonemizer")
+
         from phonemizer.backend.espeak import words_mismatch
         from phonemizer.backend.espeak.words_mismatch import Ignore
 
