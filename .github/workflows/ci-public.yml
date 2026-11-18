@@ -71,7 +71,10 @@ jobs:
 
   checks:
     if: ${{ !github.event.repository.private }}
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest now resolves to 26.04 and Playwright 1.58 does not
+    # support chromium there ("Playwright does not support chromium on
+    # ubuntu26.04-x64"). 24.04 is the newest release Playwright installs on.
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
       # Read by the test harness when it wants a database. The same two storage rules as
@@ -95,16 +98,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg
-
-      # Rendering services exercise Playwright; the runners ship no browsers.
-      # Conditional so repos that do not depend on Playwright pay nothing.
-      # Measured 2026-11-18 on html_render_service: 30 failures, all
-      # "Executable doesn't exist … playwright install".
-      - name: install Playwright browsers (only when the repo uses Playwright)
-        run: |
-          if uv run python -c 'import playwright' >/dev/null 2>&1; then
-            uv run playwright install --with-deps chromium
-          fi
 
       - name: start Postgres 18
         run: |
@@ -133,6 +126,16 @@ jobs:
       # red. Dropping extras silently removes whole test directories.
       - name: install (locked)
         run: uv sync --frozen --all-extras
+
+      # Rendering services exercise Playwright; the runners ship no browsers.
+      # Conditional so repos that do not depend on Playwright pay nothing.
+      # Measured 2026-11-18 on html_render_service: 30 failures, all
+      # "Executable doesn't exist … playwright install".
+      - name: install Playwright browsers (only when the repo uses Playwright)
+        run: |
+          if uv run python -c 'import playwright' >/dev/null 2>&1; then
+            uv run playwright install --with-deps chromium
+          fi
 
       - name: ruff check
         run: uv run ruff check .
