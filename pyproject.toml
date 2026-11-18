@@ -1,0 +1,174 @@
+[project]
+license = "Apache-2.0"
+name = "tts-backend"
+version = "0.1.0"
+description = "TTS (text-to-speech) inference backend for Apple Silicon — Kokoro + Kitten"
+requires-python = ">=3.14"
+dependencies = [
+    # CI audit fixes for the already-present torch/build transitive dependencies.
+    "filelock>=4.2.1",
+    "setuptools>=84.1.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "pydantic>=2.9.0",
+    "python-dotenv>=1.2.2",
+    "psutil>=6.0.0",
+    "prometheus-fastapi-instrumentator>=7.0.0",
+    # Direct import as of the cancelled-synthesis counter (routers/tts_routes.py):
+    # `from prometheus_client import Counter`. It arrived transitively via the
+    # instrumentator above and the lock already resolves 0.26.0, so this declares
+    # a dependency that is already present rather than adding one -- but an
+    # undeclared direct import breaks the day the instrumentator drops or renames
+    # it, and nothing would point at this file.
+    "prometheus-client>=0.26.0",
+    "numpy>=1.24.0",
+    "soundfile>=0.12.1",
+    # Number/time/decimal -> words for TTS pre-processing (pure Python, cross-platform
+    # so the text_preproc module imports on Linux CI where kokoro-onnx is darwin-gated).
+    "num2words>=0.5.13",
+    # Safe XML parsing for SSML on /synthesize (services/ssml_processor). Pure
+    # Python, cross-platform (imported unconditionally, so not darwin-gated).
+    "defusedxml>=0.7.1",
+    "httpx>=0.28.1",
+    "cachetools>=5.5.0",
+    "redis>=7.3.0",
+    # Fleet-canonical auth: AuthMiddleware + User come from w2v_common (single-flight
+    # license introspection + 10s timeout as of 0.20.1). Replaces the vendored copy.
+    # >=0.22.0 carries the X-Effective-Tenant-Id honour-gate so background-run TTS
+    # cost events attribute to the run tenant, not the orchestrator SA tenant.
+    # The `<0.67` ceiling is GONE (2026-08-30). It was deliberate: it held this
+    # service below w2v_common #127 ("tenant is a required uuid; no sentinel, no
+    # substitution") until the emit path was proven to refuse a missing tenant
+    # rather than drop it. #47 did that — `auth.dependencies.require_tenant` 401s
+    # at dependency time, before any route body runs — so the precondition is met
+    # and the pin outlived its reason. (There is no `except Exception` around the
+    # emit in this repo; that swallow lives upstream in w2v_common's cost_bus.)
+    # Floor WAS 0.67.10, which carries #138 (omitting tenant_source PRESERVES
+    # provenance) and #119 (the metering Redis DSN, password included, was logged
+    # at INFO on every boot — live in this service on 2026-08-28).
+    # Raised to 0.69.0 (#168, 4dd1c66): the `metadata_extra` kwarg on
+    # `schedule_cost_event`, which is the ONLY way to stamp billing's metadata
+    # allowlist (schema_id, job_id, fallback_used, stage, worker_name,
+    # caller_client_id). Before it the fields were unreachable from a consumer.
+    # The floor is a real floor, not decoration: `uv.lock` pins ONE version, so
+    # a `>=` that the lock has not been walked forward to buys nothing — the
+    # lock below resolves 0.75.0.
+    # Raised to 0.75.0: `w2v_common.auth.LICENSE_GATE` / `require_license` — the
+    # shared entitlement gate mounted on the `/api/tts` router. That symbol does
+    # not exist below 0.75.0, so the floor is what makes the import safe; the lock
+    # already resolves 0.75.0 (chore(deps) 1e84574), so no lock walk is needed.
+    # NOT raised to 0.76.0: 0.76.0 only adds `LICENSE_GATE_WS` / `require_license_ws`
+    # for WebSocket routes, and this service has none (no `WebSocket` anywhere in
+    # `src/`) — a floor bought for a symbol we never import is decoration.
+    # Raised to 0.97.0: `w2v_common.admission` (AdmissionGate / LaneConfig /
+    # install_gpu_busy_handler), the GPU admission lane on /synthesize (#70).
+    # Raised to 0.99.0: `DisconnectProbeMiddleware` -- without it the gate's
+    # client-gone skip never fires behind this app's BaseHTTPMiddleware layers.
+    # Raised to 0.112.0: W2V_LICENSE_GATE_APP_KEYS / W2V_LICENSE_GATE_TOKEN_APP_KEYS
+    # (w2v_common#238, published as 0.112.0 by #240 — the 0.111.0 wheel is #237's
+    # and lacks the gate) — TTS is a shared platform `speech` service (owner
+    # 2026-10-22); below 0.112.0 the gate hard-codes app key `w2v` and the env is inert.
+    # Raised to 0.115.0 (realm-per-app P7, w2v_common#242): KEYCLOAK_SERVICE_REALM —
+    # the realm the outbound `w2v-backend` S2S token (licenses.test reads) is
+    # minted from. Set to `secure-apps` in gitops external-services/tts-backend.yaml
+    # so this service stops minting from realm `portal` (staff-only). Below 0.115.0
+    # the env is inert and the token keeps coming from KEYCLOAK_REALM (`portal`).
+    "w2v-common>=0.115.0",
+    # Apple-Silicon-only TTS engines (sys_platform-gated so Linux CI doesn't try)
+    "kokoro-onnx>=0.6.1 ; sys_platform == 'darwin'",
+    # The PyTorch kokoro package, used ONLY by TTS_ENGINE=kokoro-torch (default is
+    # still kokoro-onnx). Its KPipeline is the only kokoro API that reports per-word
+    # start_ts/end_ts, which is what lets /synthesize return word_timings and delete
+    # the orchestrator's Whisper-ASR round-trip. Adds kokoro + loguru only — torch,
+    # transformers and misaki[en] are already deps below. Its misaki G2P needs the
+    # `en_core_web_sm` wheel pinned further down; without that pin misaki tries a
+    # runtime `spacy.cli.download`, which shells out to pip and dies in a uv venv
+    # ("No package installer found"). Keep them together.
+    "kokoro>=0.9.4 ; sys_platform == 'darwin'",
+    "onnxruntime>=1.20.0 ; sys_platform == 'darwin'",
+    "torch>=2.13.0 ; sys_platform == 'darwin'",
+    "transformers>=5.10.0 ; sys_platform == 'darwin'",
+    # misaki is kokoro's real dictionary G2P (feeds kokoro.create(is_phonemes=True)
+    # via services/g2p.py). Pulls spaCy + num2words; darwin-gated like the engines.
+    "misaki[en]>=0.9.4 ; sys_platform == 'darwin'",
+    # spaCy English model as a PINNED wheel — misaki's G2P.__init__ otherwise does a
+    # runtime `spacy.cli.download` (a boot-time network fetch). Installing it as a
+    # dep keeps the on-device deploy offline-deterministic. Needs spaCy 3.8.x, which
+    # misaki[en] pins. `click` is the spaCy CLI runtime dep (not always pulled).
+    "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl ; sys_platform == 'darwin'",
+    "click>=8.3.3 ; sys_platform == 'darwin'",
+]
+
+[tool.uv]
+# w2v-common is published to the internal PyPI (self-signed CA → insecure-host).
+# Build-environment pin, NOT a runtime dependency. `curated-tokenizers` 0.0.9
+# (transitive: misaki[en] -> spacy-curated-transformers -> curated-tokenizers)
+# ships no cp314 wheel, so uv must cythonize its sdist. Cython 3.3.0 (released
+# 2026-08-22) fails on curated_tokenizers/_bbpe.pyx with
+# "Cython.Compiler.Errors.CompileError: curated_tokenizers/_bbpe.pyx", which
+# reds `uv sync` on every COLD build cache. 3.2.9 compiles it.
+# Same pin, same reason, as tts_service (see its pyproject [tool.uv]).
+# Drop this pin when curated-tokenizers builds under 3.3.
+build-constraint-dependencies = ["cython<3.3"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = {find = {where = ["src"]}}
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+    "pytest-asyncio>=1.3.0",
+    "pytest-mock>=3.14.0",
+    "pytest-cov>=7.0.0",
+    "httpx>=0.28.1",
+    "ruff>=0.15",
+    "ty>=0.0.32",
+    "bandit>=1.8.0",
+    "pip-audit>=2.9.0",
+    # Transitive via pip-audit -> pip-api -> pip. PYSEC-2026-3721 affects
+    # pip < 26.2; declared explicitly so a future `uv lock` cannot walk the
+    # lock back into the vulnerable range with pip-audit still green.
+    "pip>=26.2",
+    "detect-secrets>=1.5.0",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py314"
+exclude = ["__pycache__", ".venv", "logs"]
+
+[tool.ruff.lint]
+select = ["F", "E", "W", "B", "UP", "I", "S", "BLE"]
+ignore = ["S101", "S104", "B008"]
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.local-ci]
+skip_tests = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-v --tb=short --strict-markers"
+markers = ["unit: Unit tests", "integration: Integration tests"]
+
+[tool.ty.environment]
+python-version = "3.14"
+extra-paths = ["src"]
+
+[tool.ty.rules]
+import-not-found = "ignore"
+
+[tool.uv.sources]
+# The published source tree resolves its shared library from the public
+# repository at the release tag; the private index is not reachable here.
+w2v-common = { git = "https://github.com/nonagenticai/w2v_common", tag = "v0.115.4" }
